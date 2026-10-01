@@ -252,6 +252,18 @@ chmod +x "/root/quest_traffic.sh"
 # 保存阈值到独立文件（让查询脚本能读到）
 echo "${traffic_limit_gb}" > "/root/traffic_limit_gb"
 
+# =========创建全局 traffic 命令（软链到 /usr/local/bin）=========
+# 这样你 SSH 进去随时敲 'traffic' 就能查，不用记路径
+TRAFFIC_BIN="/usr/local/bin/traffic"
+if [[ -f "/root/quest_traffic.sh" ]]; then
+    ln -sf /root/quest_traffic.sh "${TRAFFIC_BIN}"
+    chmod +x /root/quest_traffic.sh "${TRAFFIC_BIN}"
+    echo ""
+    echo "✅ 全局命令已创建：traffic"
+    echo "   现在在任意位置直接输入 traffic 回车即可查询流量"
+    echo "   （新打开的 SSH 会话需要重新登录生效，或执行 source ~/.bashrc）"
+fi
+
 echo ""
 echo "查询脚本已生成：/root/quest_traffic.sh"
 echo "现在可执行查询：bash /root/quest_traffic.sh"
