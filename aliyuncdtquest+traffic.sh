@@ -130,19 +130,16 @@ EOF
 sed -i "s|__INTERFACE__|${interface_name}|g; s|__LIMIT_GB__|${traffic_limit_gb}|g" "${SCRIPT_PATH}"
 chmod +x "${SCRIPT_PATH}"
 
-# 添加定时任务：每1分钟运行一次
+# 同时定义两条 cron 任务，最后一次性写入（避免分两次写互相覆盖）
 CRON_JOB="*/1 * * * * /bin/bash ${SCRIPT_PATH} >> ${LOG_FILE} 2>&1"
-# 先清理掉历史残留的检测任务（按SCRIPT_PATH路径去重，避免重复添加）
-( crontab -l 2>/dev/null | grep -v -F "${SCRIPT_PATH}" ) | crontab -
-( crontab -l 2>/dev/null; echo "${CRON_JOB}" ) | crontab -
-echo ">>> 已添加/刷新crontab检测任务，每1分钟检测一次"
-
-# =========每月1号北京时间0点0分重置vnstat统计=========
-# 关键：CRON_TZ 强制cron按北京时间解析时间字段，避免服务器是UTC时少算8小时
 RESET_JOB="CRON_TZ=Asia/Shanghai 0 0 1 * * /usr/bin/vnstat -i ${interface_name} --reset >> ${LOG_FILE} 2>&1"
-# 清理历史重置任务
-( crontab -l 2>/dev/null | grep -v -F "--reset" ) | crontab -
-( crontab -l 2>/dev/null; echo "${RESET_JOB}" ) | crontab -
+
+# 一次性清掉本脚本管理的两条历史任务（按 SCRIPT_PATH 和 --reset 特征去重）
+( crontab -l 2>/dev/null | grep -v -F "${SCRIPT_PATH}" | grep -v -F "--reset" ) | crontab -
+# 再一次性追加两条，避免后一次写入覆盖前一次
+( crontab -l 2>/dev/null; echo "${CRON_JOB}"; echo "${RESET_JOB}" ) | crontab -
+
+echo ">>> 已添加/刷新crontab检测任务，每1分钟检测一次"
 echo ">>> 已添加/刷新每月1号北京时间0点流量重置任务"
 
 echo ""
