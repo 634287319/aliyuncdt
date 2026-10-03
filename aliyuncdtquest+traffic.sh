@@ -87,96 +87,44 @@ touch "${LOG_FILE}"
 cat > "${SCRIPT_PATH}" <<'EOF'
 #!/bin/bash
 export TZ='Asia/Shanghai'
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 NET_IF="__INTERFACE__"
 LIMIT_GB="__LIMIT_GB__"
 LOG="/root/shutdown_debug.log"
 STATE_FILE="/root/vnstat_reset.state"
-LOCK_FILE="/root/shutdown.lock"
 
 [ ! -f "${LOG}" ] && touch "${LOG}"
 
-# =========跨月补偿重置（开机补刀，防止cron错过）=========
-# 当前北京时间年月，例如 202610
+# 跨月补偿：开机补刀重置
 CUR_YM=$(date '+%Y%m')
 LAST_YM=""
 [ -f "${STATE_FILE}" ] && LAST_YM=$(cat "${STATE_FILE}" 2>/dev/null)
 if [[ "${CUR_YM}" != "${LAST_YM}" ]]; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 检测到跨月（上次:${LAST_YM:-无} 当前:${CUR_YM}），立即重置vnstat" >> "${LOG_FILE}"
-    /usr/bin/vnstat -i "${NET_IF}" --reset >> "${LOG_FILE}" 2>&1
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 检测到跨月，重置vnstat" >> "${LOG}"
+    /usr/bin/vnstat -i "${NET_IF}" --reset >> "${LOG}" 2>&1
     echo "${CUR_YM}" > "${STATE_FILE}"
 fi
 
 TX_BYTES=$(vnstat --oneline b -i "${NET_IF}" | awk -F';' '{print $10}')
 
-# 空值防御：vnstat没有拿到数据直接跳过，避免integer expression expected报错
-if [[ -z "${TX_BYTES}" || ! "${TX_BYTES}" =~ ^[0-9]+$ ]];then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 网卡${NET_IF}：vnstat流量数据无效（TX_BYTES='${TX_BYTES}'），跳过本次检测" >> "${LOG}"
+# 空值防御
+if [[ -z "${TX_BYTES}" || ! "${TX_BYTES}" =~ ^[0-9]+$ ]]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 网卡${NET_IF}：vnstat流量数据无效，跳过本次检测" >> "${LOG}"
     exit 0
 fi
 
-# 阿里云CDT按10进制计费：1 GB = 1,000,000,000 字节（不是1024^3）
+# 阿里云CDT按10进制计费：1 GB = 1,000,000,000 字节
 GB_UNIT=1000000000
 TX_GB=$(echo "scale=4; ${TX_BYTES}/${GB_UNIT}" | bc)
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] 检测 网卡${NET_IF} 出网TX:${TX_GB}GB 阈值:${LIMIT_GB}GB" >> "${LOG}"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] 网卡${NET_IF} 出网TX:${TX_GB}GB 阈值:${LIMIT_GB}GB" >> "${LOG}"
 
-# ========== 触发关机判断 ==========
-# 关键：避免 bc 多次求值导致状态切换抖动，先算一次结果再比较
-USAGE_PCT=$(echo "scale=4; (${TX_GB}*100)/${LIMIT_GB}" | bc)
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] 检测 使用率:${USAGE_PCT}%" >> "${LOG}"
-
-# 双重判断：绝对阈值 + 百分比（防止极限边界 bc 输出歧义）
-COMP_ABS=$(echo "${TX_GB} >= ${LIMIT_GB}" | bc)
-COMP_PCT=$(echo "${USAGE_PCT} >= 90" | bc)
-
-if [[ "${COMP_ABS}" == "1" ]] || [[ "${COMP_PCT}" == "1" ]]; then
-    # 防抖：lock文件避免并发 cron 任务重复触发（理论上 */1 不会重叠，但保险）
-    if [[ -f "${LOCK_FILE}" ]]; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 已在关机流程中（lock存在），跳过本次" >> "${LOG}"
-        exit 0
-    fi
-    touch "${LOCK_FILE}"
-
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] !!!流量超限 TX=${TX_GB}GB >= 阈值=${LIMIT_GB}GB (使用率=${USAGE_PCT}%)" >> "${LOG}"
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 准备执行 shutdown -h now..." >> "${LOG}"
-
-    # ========== 双重防护：先 sync 数据到磁盘，再关机 ==========
-    sync
-    sleep 1
-
-    # 尝试 1：systemctl poweroff（标准）
-    if command -v systemctl &>/dev/null; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 尝试 systemctl poweroff..." >> "${LOG}"
-        systemctl poweroff >> "${LOG}" 2>&1 &
-        SHUTDOWN_PID=$!
-        sleep 5
-        # 5秒后还在运行，说明 systemctl 失败了
-        if kill -0 "${SHUTDOWN_PID}" 2>/dev/null; then
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] systemctl poweroff 失败，尝试 shutdown 命令..." >> "${LOG}"
-            kill -9 "${SHUTDOWN_PID}" 2>/dev/null
-            shutdown -h now >> "${LOG}" 2>&1 &
-            sleep 5
-        fi
-    else
-        # 尝试 2：直接 shutdown 命令
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 无 systemctl，使用 shutdown -h now..." >> "${LOG}"
-        shutdown -h now >> "${LOG}" 2>&1 &
-    fi
-
-    # 8秒兜底：直接 init 0 / halt
-    sleep 3
-    if [[ -f /proc/1/stat ]]; then
-        PID1=$(awk '{print $1}' /proc/1/stat 2>/dev/null)
-        if [[ "${PID1}" != "1" ]]; then
-            # PID 1 不是 init，可能是容器，记录警告但不执行 init 0
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] 警告：检测到容器环境（PID 1 != 1），关机指令可能不生效" >> "${LOG}"
-        fi
-    fi
-
-    # 15秒还没关机，最后兜底
-    sleep 7
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 兜底执行 poweroff -f..." >> "${LOG}"
-    poweroff -f >> "${LOG}" 2>&1
+# 关机判断：参照参考脚本的简洁方式
+COMP_RESULT=$(echo "${TX_GB} >= ${LIMIT_GB}" | bc)
+if [ "${COMP_RESULT}" -eq 1 ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] !!!流量达到阈值，执行关机" >> "${LOG}"
+    # 用绝对路径调用（兼容 cron PATH 缺失）+ shutdown 命令（绕开 polkit 拦截）
+    /usr/sbin/shutdown -h now "流量超限自动关机：TX=${TX_GB}GB"
 fi
 EOF
 
