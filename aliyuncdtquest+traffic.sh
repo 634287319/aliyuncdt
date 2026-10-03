@@ -91,6 +91,7 @@ NET_IF="__INTERFACE__"
 LIMIT_GB="__LIMIT_GB__"
 LOG="/root/shutdown_debug.log"
 STATE_FILE="/root/vnstat_reset.state"
+LOCK_FILE="/root/shutdown.lock"
 
 [ ! -f "${LOG}" ] && touch "${LOG}"
 
@@ -109,7 +110,7 @@ TX_BYTES=$(vnstat --oneline b -i "${NET_IF}" | awk -F';' '{print $10}')
 
 # 空值防御：vnstat没有拿到数据直接跳过，避免integer expression expected报错
 if [[ -z "${TX_BYTES}" || ! "${TX_BYTES}" =~ ^[0-9]+$ ]];then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 网卡${NET_IF}：vnstat流量数据无效，跳过本次检测" >> "${LOG}"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 网卡${NET_IF}：vnstat流量数据无效（TX_BYTES='${TX_BYTES}'），跳过本次检测" >> "${LOG}"
     exit 0
 fi
 
@@ -117,12 +118,65 @@ fi
 GB_UNIT=1000000000
 TX_GB=$(echo "scale=4; ${TX_BYTES}/${GB_UNIT}" | bc)
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] 网卡${NET_IF} 出网TX:${TX_GB}GB 阈值:${LIMIT_GB}GB" >> "${LOG}"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] 检测 网卡${NET_IF} 出网TX:${TX_GB}GB 阈值:${LIMIT_GB}GB" >> "${LOG}"
 
-COMP_RESULT=$(echo "${TX_GB} >= ${LIMIT_GB}" | bc)
-if [ "${COMP_RESULT}" -eq 1 ];then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] !!!流量达到阈值，执行关机" >> "${LOG}"
-    systemctl poweroff
+# ========== 触发关机判断 ==========
+# 关键：避免 bc 多次求值导致状态切换抖动，先算一次结果再比较
+USAGE_PCT=$(echo "scale=4; (${TX_GB}*100)/${LIMIT_GB}" | bc)
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] 检测 使用率:${USAGE_PCT}%" >> "${LOG}"
+
+# 双重判断：绝对阈值 + 百分比（防止极限边界 bc 输出歧义）
+COMP_ABS=$(echo "${TX_GB} >= ${LIMIT_GB}" | bc)
+COMP_PCT=$(echo "${USAGE_PCT} >= 90" | bc)
+
+if [[ "${COMP_ABS}" == "1" ]] || [[ "${COMP_PCT}" == "1" ]]; then
+    # 防抖：lock文件避免并发 cron 任务重复触发（理论上 */1 不会重叠，但保险）
+    if [[ -f "${LOCK_FILE}" ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 已在关机流程中（lock存在），跳过本次" >> "${LOG}"
+        exit 0
+    fi
+    touch "${LOCK_FILE}"
+
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] !!!流量超限 TX=${TX_GB}GB >= 阈值=${LIMIT_GB}GB (使用率=${USAGE_PCT}%)" >> "${LOG}"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 准备执行 shutdown -h now..." >> "${LOG}"
+
+    # ========== 双重防护：先 sync 数据到磁盘，再关机 ==========
+    sync
+    sleep 1
+
+    # 尝试 1：systemctl poweroff（标准）
+    if command -v systemctl &>/dev/null; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 尝试 systemctl poweroff..." >> "${LOG}"
+        systemctl poweroff >> "${LOG}" 2>&1 &
+        SHUTDOWN_PID=$!
+        sleep 5
+        # 5秒后还在运行，说明 systemctl 失败了
+        if kill -0 "${SHUTDOWN_PID}" 2>/dev/null; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] systemctl poweroff 失败，尝试 shutdown 命令..." >> "${LOG}"
+            kill -9 "${SHUTDOWN_PID}" 2>/dev/null
+            shutdown -h now >> "${LOG}" 2>&1 &
+            sleep 5
+        fi
+    else
+        # 尝试 2：直接 shutdown 命令
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 无 systemctl，使用 shutdown -h now..." >> "${LOG}"
+        shutdown -h now >> "${LOG}" 2>&1 &
+    fi
+
+    # 8秒兜底：直接 init 0 / halt
+    sleep 3
+    if [[ -f /proc/1/stat ]]; then
+        PID1=$(awk '{print $1}' /proc/1/stat 2>/dev/null)
+        if [[ "${PID1}" != "1" ]]; then
+            # PID 1 不是 init，可能是容器，记录警告但不执行 init 0
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] 警告：检测到容器环境（PID 1 != 1），关机指令可能不生效" >> "${LOG}"
+        fi
+    fi
+
+    # 15秒还没关机，最后兜底
+    sleep 7
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 兜底执行 poweroff -f..." >> "${LOG}"
+    poweroff -f >> "${LOG}" 2>&1
 fi
 EOF
 
@@ -131,11 +185,31 @@ sed -i "s|__INTERFACE__|${interface_name}|g; s|__LIMIT_GB__|${traffic_limit_gb}|
 chmod +x "${SCRIPT_PATH}"
 
 # 添加定时任务：每1分钟运行一次
+# 关键：不能加 >/dev/null 也不能加 & ，否则会丢失 stdout / 脱离 shell
 CRON_JOB="*/1 * * * * /bin/bash ${SCRIPT_PATH} >> ${LOG_FILE} 2>&1"
 # 先清理掉历史残留的检测任务（按SCRIPT_PATH路径去重，避免重复添加）
 ( crontab -l 2>/dev/null | grep -v -F "${SCRIPT_PATH}" ) | crontab -
 ( crontab -l 2>/dev/null; echo "${CRON_JOB}" ) | crontab -
 echo ">>> 已添加/刷新crontab检测任务，每1分钟检测一次"
+
+# =========确保 cron 服务正在运行（不依赖镜像默认值）=========
+# 容器里很多镜像没启动 cron，这是不关机第一大原因
+if command -v systemctl &>/dev/null; then
+    systemctl enable cron 2>/dev/null
+    systemctl restart cron 2>/dev/null
+elif command -v service &>/dev/null; then
+    service cron restart 2>/dev/null
+else
+    # 没有 service / systemctl：直接启动 cron 进程
+    pgrep -x cron >/dev/null 2>&1 || cron
+fi
+sleep 1
+# 验证 cron 在跑
+if pgrep -x cron >/dev/null 2>&1; then
+    echo ">>> ✅ cron 服务运行中（PID: $(pgrep -x cron | head -1)）"
+else
+    echo ">>> ⚠️  警告：cron 未运行，请检查 'systemctl status cron'"
+fi
 
 # =========每月1号北京时间0点0分重置vnstat统计=========
 # 关键：CRON_TZ 强制cron按北京时间解析时间字段，避免服务器是UTC时少算8小时
@@ -155,6 +229,8 @@ echo "日志文件：${LOG_FILE}"
 echo "查询命令：bash aliyuncdtquest+traffic.sh query"
 echo "查看定时任务：crontab -l"
 echo "实时查看日志：tail -f ${LOG_FILE}"
+echo "手动测试检测脚本：rm -f /root/shutdown.lock && bash /root/check.sh"
+echo "查看 shutdown lock 状态：ls -la /root/shutdown.lock 2>/dev/null"
 
 # =========生成独立查询脚本 /root/quest_traffic.sh=========
 cat > "/root/quest_traffic.sh" <<'QEOF'
