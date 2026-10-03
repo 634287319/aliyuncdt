@@ -87,7 +87,6 @@ touch "${LOG_FILE}"
 cat > "${SCRIPT_PATH}" <<'EOF'
 #!/bin/bash
 export TZ='Asia/Shanghai'
-export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 NET_IF="__INTERFACE__"
 LIMIT_GB="__LIMIT_GB__"
 LOG="/root/shutdown_debug.log"
@@ -95,36 +94,35 @@ STATE_FILE="/root/vnstat_reset.state"
 
 [ ! -f "${LOG}" ] && touch "${LOG}"
 
-# 跨月补偿：开机补刀重置
+# =========跨月补偿重置（开机补刀，防止cron错过）=========
+# 当前北京时间年月，例如 202610
 CUR_YM=$(date '+%Y%m')
 LAST_YM=""
 [ -f "${STATE_FILE}" ] && LAST_YM=$(cat "${STATE_FILE}" 2>/dev/null)
 if [[ "${CUR_YM}" != "${LAST_YM}" ]]; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 检测到跨月，重置vnstat" >> "${LOG}"
-    /usr/bin/vnstat -i "${NET_IF}" --reset >> "${LOG}" 2>&1
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 检测到跨月（上次:${LAST_YM:-无} 当前:${CUR_YM}），立即重置vnstat" >> "${LOG_FILE}"
+    /usr/bin/vnstat -i "${NET_IF}" --reset >> "${LOG_FILE}" 2>&1
     echo "${CUR_YM}" > "${STATE_FILE}"
 fi
 
 TX_BYTES=$(vnstat --oneline b -i "${NET_IF}" | awk -F';' '{print $10}')
 
-# 空值防御
-if [[ -z "${TX_BYTES}" || ! "${TX_BYTES}" =~ ^[0-9]+$ ]]; then
+# 空值防御：vnstat没有拿到数据直接跳过，避免integer expression expected报错
+if [[ -z "${TX_BYTES}" || ! "${TX_BYTES}" =~ ^[0-9]+$ ]];then
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] 网卡${NET_IF}：vnstat流量数据无效，跳过本次检测" >> "${LOG}"
     exit 0
 fi
 
-# 阿里云CDT按10进制计费：1 GB = 1,000,000,000 字节
+# 阿里云CDT按10进制计费：1 GB = 1,000,000,000 字节（不是1024^3）
 GB_UNIT=1000000000
 TX_GB=$(echo "scale=4; ${TX_BYTES}/${GB_UNIT}" | bc)
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] 网卡${NET_IF} 出网TX:${TX_GB}GB 阈值:${LIMIT_GB}GB" >> "${LOG}"
 
-# 关机判断：参照参考脚本的简洁方式
 COMP_RESULT=$(echo "${TX_GB} >= ${LIMIT_GB}" | bc)
-if [ "${COMP_RESULT}" -eq 1 ]; then
+if [ "${COMP_RESULT}" -eq 1 ];then
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] !!!流量达到阈值，执行关机" >> "${LOG}"
-    # 用绝对路径调用（兼容 cron PATH 缺失）+ shutdown 命令（绕开 polkit 拦截）
-    /usr/sbin/shutdown -h now "流量超限自动关机：TX=${TX_GB}GB"
+    systemctl poweroff
 fi
 EOF
 
@@ -133,31 +131,11 @@ sed -i "s|__INTERFACE__|${interface_name}|g; s|__LIMIT_GB__|${traffic_limit_gb}|
 chmod +x "${SCRIPT_PATH}"
 
 # 添加定时任务：每1分钟运行一次
-# 关键：不能加 >/dev/null 也不能加 & ，否则会丢失 stdout / 脱离 shell
 CRON_JOB="*/1 * * * * /bin/bash ${SCRIPT_PATH} >> ${LOG_FILE} 2>&1"
 # 先清理掉历史残留的检测任务（按SCRIPT_PATH路径去重，避免重复添加）
 ( crontab -l 2>/dev/null | grep -v -F "${SCRIPT_PATH}" ) | crontab -
 ( crontab -l 2>/dev/null; echo "${CRON_JOB}" ) | crontab -
 echo ">>> 已添加/刷新crontab检测任务，每1分钟检测一次"
-
-# =========确保 cron 服务正在运行（不依赖镜像默认值）=========
-# 容器里很多镜像没启动 cron，这是不关机第一大原因
-if command -v systemctl &>/dev/null; then
-    systemctl enable cron 2>/dev/null
-    systemctl restart cron 2>/dev/null
-elif command -v service &>/dev/null; then
-    service cron restart 2>/dev/null
-else
-    # 没有 service / systemctl：直接启动 cron 进程
-    pgrep -x cron >/dev/null 2>&1 || cron
-fi
-sleep 1
-# 验证 cron 在跑
-if pgrep -x cron >/dev/null 2>&1; then
-    echo ">>> ✅ cron 服务运行中（PID: $(pgrep -x cron | head -1)）"
-else
-    echo ">>> ⚠️  警告：cron 未运行，请检查 'systemctl status cron'"
-fi
 
 # =========每月1号北京时间0点0分重置vnstat统计=========
 # 关键：CRON_TZ 强制cron按北京时间解析时间字段，避免服务器是UTC时少算8小时
@@ -177,8 +155,6 @@ echo "日志文件：${LOG_FILE}"
 echo "查询命令：bash aliyuncdtquest+traffic.sh query"
 echo "查看定时任务：crontab -l"
 echo "实时查看日志：tail -f ${LOG_FILE}"
-echo "手动测试检测脚本：rm -f /root/shutdown.lock && bash /root/check.sh"
-echo "查看 shutdown lock 状态：ls -la /root/shutdown.lock 2>/dev/null"
 
 # =========生成独立查询脚本 /root/quest_traffic.sh=========
 cat > "/root/quest_traffic.sh" <<'QEOF'
