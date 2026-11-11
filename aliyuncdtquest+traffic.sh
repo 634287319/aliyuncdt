@@ -63,6 +63,65 @@ then
     sleep 4
 fi
 
+# =========配置 vnstat 为1分钟统计粒度（默认5分钟）=========
+# vnstatd 的 UpdateInterval 默认 300 秒（5分钟），改为 60 秒（1分钟）
+# SaveInterval 默认 5（分钟），改为 1 让落盘也保持1分钟一致
+# 注意：发行版默认配置里这些项前面带 ';' 是注释状态，必须同时处理
+#       ;UpdateInterval 20  →  UpdateInterval 60
+#       UpdateInterval 20   →  UpdateInterval 60
+configure_vnstat_1min() {
+    local conf="/etc/vnstat.conf"
+    if [[ ! -f "${conf}" ]]; then
+        echo ">>> ⚠️  未找到 ${conf}，vnstat 可能未使用配置文件"
+        return
+    fi
+    # 备份原配置
+    [[ -f "${conf}.bak" ]] || cp "${conf}" "${conf}.bak"
+
+    # ---------- 通用配置项设置函数 ----------
+    # 参数1: 配置项名  参数2: 目标值
+    set_vnstat_opt() {
+        local key="$1" val="$2"
+        # 情况1: 已有未注释的有效配置项 → 直接替换值
+        if grep -qE "^\s*${key}\s+" "${conf}"; then
+            sed -i "s|^\s*${key}\s\+.*|${key} ${val}|" "${conf}"
+        # 情况2: 只有注释掉的版本（;UpdateInterval 20）→ 取消注释并改值
+        elif grep -qE "^\s*;\s*${key}\s" "${conf}"; then
+            sed -i "s|^\s*;\s*${key}\s*.*|${key} ${val}|" "${conf}"
+        # 情况3: 完全不存在 → 追加到 [global] 段
+        else
+            sed -i "/^\[global\]/a ${key} ${val}" "${conf}"
+        fi
+    }
+
+    # UpdateInterval: 读取内核计数器的间隔（秒）
+    set_vnstat_opt "UpdateInterval" "60"
+    # SaveInterval: 内存数据落盘间隔（分钟）
+    set_vnstat_opt "SaveInterval" "1"
+
+    # 各网卡独立配置段 [ifs] 也统一处理一遍
+    if grep -q '^\[ifs\]' "${conf}"; then
+        sed -i '/^\[ifs\]/,/^\[/ s|^\s*;\?\s*UpdateInterval\s*.*|UpdateInterval 60|' "${conf}"
+        sed -i '/^\[ifs\]/,/^\[/ s|^\s*;\?\s*SaveInterval\s*.*|SaveInterval 1|' "${conf}"
+    fi
+
+    echo ">>> vnstat 配置结果："
+    grep -nE '^\s*UpdateInterval|^\s*SaveInterval' "${conf}" | sed 's/^/    /'
+}
+
+configure_vnstat_1min
+
+# 重启 vnstatd 让新配置生效
+if systemctl list-unit-files 2>/dev/null | grep -q "vnstat"; then
+    systemctl restart vnstat 2>/dev/null
+    sleep 2
+elif pgrep -x vnstatd >/dev/null 2>&1; then
+    pkill -x vnstatd 2>/dev/null
+    sleep 1
+    vnstatd 2>/dev/null &
+    sleep 2
+fi
+
 # =========自动安装 bc 计算器 =========
 if ! command -v bc &> /dev/null
 then
@@ -105,7 +164,11 @@ if [[ "${CUR_YM}" != "${LAST_YM}" ]]; then
     echo "${CUR_YM}" > "${STATE_FILE}"
 fi
 
-TX_BYTES=$(vnstat --oneline b -i "${NET_IF}" | awk -F';' '{print $10}')
+TX_BYTES=$(/usr/bin/vnstat --sync --oneline b -i "${NET_IF}" 2>/dev/null | awk -F';' '{print $10}')
+# --sync 失败时回退到普通读取
+if [[ -z "${TX_BYTES}" || ! "${TX_BYTES}" =~ ^[0-9]+$ ]]; then
+    TX_BYTES=$(/usr/bin/vnstat --oneline b -i "${NET_IF}" 2>/dev/null | awk -F';' '{print $10}')
+fi
 
 # 空值防御：vnstat没有拿到数据直接跳过，避免integer expression expected报错
 if [[ -z "${TX_BYTES}" || ! "${TX_BYTES}" =~ ^[0-9]+$ ]];then
@@ -147,6 +210,7 @@ echo "====部署完成===="
 echo "网卡：${interface_name}"
 echo "出网流量阈值：${traffic_limit_gb} GB（按阿里云CDT 10进制计费）"
 echo "时区：$(date '+%Z %z')（应为CST +0800）"
+echo "vnstat配置：$(grep -E '^\s*UpdateInterval|^\s*SaveInterval' /etc/vnstat.conf 2>/dev/null | tr '\n' ' ')"
 echo "检测脚本路径：${SCRIPT_PATH}"
 echo "日志文件：${LOG_FILE}"
 echo "查询命令：bash aliyuncdtquest+traffic.sh query"
@@ -181,9 +245,11 @@ fi
 # 当前月份（北京时间）
 CUR_MONTH=$(date '+%Y-%m')
 
-# 读取本月TX字节数（取 vnstat 第10列 = rx+tx，本月只用第9列 TX）
-# 这里用第10列（总流量），与原check.sh脚本保持一致
-TX_BYTES=$(vnstat --oneline b -i "${NET_IF}" | awk -F';' '{print $10}')
+# 读取本月TX字节数（--sync 强制刷新内核数据，保证1分钟粒度准确）
+TX_BYTES=$(/usr/bin/vnstat --sync --oneline b -i "${NET_IF}" 2>/dev/null | awk -F';' '{print $10}')
+if [[ -z "${TX_BYTES}" || ! "${TX_BYTES}" =~ ^[0-9]+$ ]]; then
+    TX_BYTES=$(/usr/bin/vnstat --oneline b -i "${NET_IF}" 2>/dev/null | awk -F';' '{print $10}')
+fi
 
 # 空值防御
 if [[ -z "${TX_BYTES}" || ! "${TX_BYTES}" =~ ^[0-9]+$ ]]; then
